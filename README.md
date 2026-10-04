@@ -489,6 +489,134 @@ curl -s -X POST http://localhost:8000/query \
 上例中删除 `{2,-2}` 两行反而让总和回到 `5`，目标行重新出现；每个返回
 的方案都经过重算验证且按包含关系极小。
 
+### 候选约简与搜索预算（大候选池）
+
+非单调 `sum` 的删除集只能靠**逐候选重算整条计划**穷举，代价随目标组
+来源行数指数增长。服务因此分两步控制：
+
+1. **候选约简**（搜索前，不改变答案）：枚举前先剔除可证明不属于
+   任何极小删除集的成员行。判定按目标组的每个聚合表达式逐项进行——
+   * `count(*)` 钉住每个成员，因此没有行可约简；
+   * `count(col)` 忽略 NULL，NULL 行可约简；
+   * `sum(col)` 忽略 NULL 与 `0`：混合正负组里每个非零行单独删除都会
+     改变总和（单例即杀死目标），而 `0`/NULL 行在任意其他删除之上都
+     不改变总和，故可约简；
+   * `min/max(col)`：NULL 行与不取目标极值的行可约简（混合正负组里
+     最小值恒为负、最大值恒为正，`0` 行必然不是极值持有者）。
+
+   健全性：任何含可约简行 x 的删除集，若还含非零行 y，则 `{y}` 单删
+   即改变总和、已经杀死目标，该集合不可能极小；若只含可约简行，删除后
+   组仍存在且计数、极值、总和全不变，根本不杀死目标。标签层面的约简
+   仅在成员行与源行一一对应时进行（聚合输入是 scan/filter/project
+   链，每个成员只有一个单标签见证）；否则保留完整候选池。
+2. **搜索预算**：约简后候选池仍超过 **12 行**，或整条计划重算次数
+   超过 **4096 次**时，服务**不**退回命中集近似，而是返回结构化错误
+   `COUNTERFACTUAL_BUDGET_EXCEEDED`（HTTP 422），错误体给出约简前后的
+   池规模。枚举中只会跳过**已被重算确认杀死目标的解**的严格超集
+   （必然非极小）；某个删除集未使目标消失时，其超集照常评估——
+   非单调性导致的“目标重新出现”因此不会被漏判。
+
+下面的请求组 `cid=10` 有 13 行：金额 `5, 2, -2` 再加十条 `0`，
+`total=5`。十条零行在候选约简阶段被剔除，候选池由 13 降为 3：
+
+```bash
+curl -s -X POST http://localhost:8000/query \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "idempotency_key": "readme-mixed-zeros-1",
+  "tables": [
+    {"table": "orders", "primary_key": ["oid"],
+     "columns": [{"name":"oid","type":"int"},{"name":"cid","type":"int"},{"name":"amount","type":"int"}],
+     "rows": [
+       {"oid":1,"cid":10,"amount":5},
+       {"oid":2,"cid":10,"amount":2},
+       {"oid":3,"cid":10,"amount":-2},
+       {"oid":100,"cid":10,"amount":0},
+       {"oid":101,"cid":10,"amount":0},
+       {"oid":102,"cid":10,"amount":0},
+       {"oid":103,"cid":10,"amount":0},
+       {"oid":104,"cid":10,"amount":0},
+       {"oid":105,"cid":10,"amount":0},
+       {"oid":106,"cid":10,"amount":0},
+       {"oid":107,"cid":10,"amount":0},
+       {"oid":108,"cid":10,"amount":0},
+       {"oid":109,"cid":10,"amount":0}
+     ]}
+  ],
+  "plan": {
+    "type": "aggregate",
+    "input": {"type": "scan", "table": "orders"},
+    "group_by": ["cid"],
+    "aggregates": [{"fn":"sum","column":"amount","as":"total"}]
+  },
+  "explain": {"row": {"cid":10,"total":5}}
+}'
+```
+
+实际响应（线上传输为单行紧凑 JSON；这里为可读性格式化，省略未变化的
+`result` 部分）：
+
+```json
+{
+  "status": "ok",
+  "symbol_table": [{"symbol": "s1", "source": "orders[1]"}],
+  "result": {
+    "columns": ["cid", "total"],
+    "row_count": 1,
+    "rows": [
+      {"row": {"cid": 10, "total": 5}, "witness_count": 1,
+       "minimal_witnesses": [
+         {"labels": ["orders[1]"], "symbols": ["s1"], "conjunction": "s1"}],
+       "provenance": {"dnf": "(s1)", "dnf_structured": [["s1"]],
+                      "labels_structured": [["orders[1]"]]}}
+    ]
+  },
+  "counterfactual": {
+    "target_index": 0,
+    "target": {"cid": 10, "total": 5},
+    "target_provenance": {"dnf": "(s1)", "dnf_structured": [["s1"]],
+                          "labels_structured": [["orders[1]"]]},
+    "minimal_deletion_count": 3,
+    "minimal_deletion_sets": [
+      ["orders[1]"],
+      ["orders[2]"],
+      ["orders[3]"]
+    ],
+    "scenarios": [
+      {"delete": ["orders[1]"], "target_present": false,
+       "result": {"columns": ["cid", "total"], "row_count": 1,
+                  "rows": [{"cid": 10, "total": 0}]}},
+      {"delete": ["orders[2]"], "target_present": false,
+       "result": {"columns": ["cid", "total"], "row_count": 1,
+                  "rows": [{"cid": 10, "total": 3}]}},
+      {"delete": ["orders[3]"], "target_present": false,
+       "result": {"columns": ["cid", "total"], "row_count": 1,
+                  "rows": [{"cid": 10, "total": 7}]}}
+    ]
+  }
+}
+```
+
+解读：溯源只有 `(s1)`（`{5}` 是唯一极小非空和组合），但命中集近似只会
+报告删 `orders[1]`；候选约简去掉十条零行后，穷举重算找到全部三个
+单行极小删除集，重算总和依次为 `0`、`3`、`7`，按标签顺序返回。
+
+当候选池无法约简到预算内时（例如同组同时有 `count(*)`，每个成员都被
+计数钉住、零行不可约简），响应是 HTTP 422 结构化错误，而**不是**带
+近似方案的成功响应：
+
+```json
+{"error": {
+  "code": "COUNTERFACTUAL_BUDGET_EXCEEDED",
+  "message": "The non-monotone-sum deletion-set search cannot complete within the configured budget: candidate pool of 13 source rows exceeds the search limit of 12. No approximate deletion sets are returned; narrow the target group and retry.",
+  "details": {"pool_size": 13, "reduced_pool_size": 13,
+              "max_pool_size": 12, "max_recomputations": 4096}
+}}
+```
+
+该错误同样按 `(idempotency_key, 规范化请求指纹)` 持久化，重放逐字节
+一致并带 `X-Idempotent-Replay: true`。
+
 ### 幂等重放逐字节一致
 
 ```bash
@@ -521,6 +649,7 @@ cmp a.json b.json && echo "byte-identical"   # byte-identical
 | `EMPTY_AGGREGATE` | 聚合输入为空（无法形成任何组；含标量聚合） |
 | `TYPE_ERROR` | 声明类型不符、跨类型比较/连接、对非数值求 `sum`、对布尔值做有序比较 |
 | `TARGET_NOT_FOUND` | `explain` 的 index 越界或 row 不匹配任何输出 |
+| `COUNTERFACTUAL_BUDGET_EXCEEDED` | 混合正负 `sum` 的删除集搜索在候选约简后仍超过 12 行候选或 4096 次重算预算（HTTP 422）；不返回近似方案 |
 | `IDEMPOTENCY_KEY_CONFLICT` | 幂等键已绑定到另一个规范化请求（HTTP 409） |
 
 ---
@@ -538,8 +667,14 @@ cmp a.json b.json && echo "byte-identical"   # byte-identical
   命中所有见证后，组键或某个聚合值必然改变。
 * 例外是 **含正负混合值的 `sum`**（非单调求和）：删除不属于任何极小组合的
   行也可能改变总和，且删除更多行可能让目标值重新出现，命中集刻画不再成立。
-  此时服务对目标组的来源行枚举候选删除集，**按删除后重算的完整目标行**
-  判定，返回全部按包含关系极小的方案（候选池超过 12 行时回退为命中集
-  近似）。无论走哪条路径，每个删除场景都会 **重算整条计划** 并显式给出
-  `target_present`，以重算结果为准；删除后聚合输入为空时，场景返回结构化
-  的 `recompute_error`（如 `EMPTY_AGGREGATE`）。
+  此时服务对目标组的来源行先做 **候选约简**（剔除按各聚合表达式可证明不
+  属于任何极小删除集的成员：`sum` 的 0/NULL、`count(col)` 的 NULL、
+  min/max 的非极值行；`count(*)` 存在时不剔除任何行；成员与源行非一一
+  对应时不做标签约简），再在约简后的候选池上按删除集大小逐层枚举，
+  **按删除后重算的完整目标行** 判定，返回全部按包含关系极小的方案。
+  枚举只会跳过“已被重算确认杀死目标的解”的严格超集（必非极小）；
+  非解的超集一律照常重算，故非单调的目标重现不会漏报。约简后候选池
+  仍超过 12 行（或重算超过 4096 次）时返回 `COUNTERFACTUAL_BUDGET_EXCEEDED`
+  结构化错误，绝不以命中集近似冒充成功。无论走哪条路径，每个删除场景都会
+  **重算整条计划** 并显式给出 `target_present`，以重算结果为准；删除后
+  聚合输入为空时，场景返回结构化的 `recompute_error`（如 `EMPTY_AGGREGATE`）。

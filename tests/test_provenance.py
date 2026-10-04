@@ -1,6 +1,12 @@
 """Unit tests for minimal hitting sets and witness construction."""
+import pytest
+
 from app.evaluator import Evaluator, Table
-from app.provenance import minimal_deletion_sets_by_recompute, minimal_hitting_sets
+from app.provenance import (
+    CounterfactualBudgetExceeded,
+    minimal_deletion_sets_by_recompute,
+    minimal_hitting_sets,
+)
 
 
 def L(table, *pk):
@@ -50,9 +56,29 @@ def test_deletion_sets_by_recompute():
         pool, lambda d: d == frozenset([L("t", 1)])
     )
     assert sols == [frozenset([L("t", 1)])]
-    # Pools beyond the enumeration bound refuse the search.
+    # Pools beyond the enumeration bound refuse the search with a
+    # structured budget error rather than returning an approximate answer.
     big = {L("t", i) for i in range(13)}
-    assert minimal_deletion_sets_by_recompute(big, lambda d: True) is None
+    with pytest.raises(CounterfactualBudgetExceeded):
+        minimal_deletion_sets_by_recompute(big, lambda d: True)
+
+    # A non-solution's supersets are still evaluated: when only the pair
+    # {1,2} kills (neither singleton does), the search finds it — a failing
+    # singleton never suppresses its supersets.
+    pool3 = {L("t", 1), L("t", 2), L("t", 3)}
+    sols = minimal_deletion_sets_by_recompute(
+        pool3, lambda d: d == frozenset([L("t", 1), L("t", 2)])
+    )
+    assert sols == [frozenset([L("t", 1), L("t", 2)])]
+
+    # The recomputation budget itself raises instead of truncating.
+    with pytest.raises(CounterfactualBudgetExceeded):
+        minimal_deletion_sets_by_recompute(
+            {L("t", i) for i in range(10)},
+            lambda d: False,
+            max_pool_size=12,
+            max_evaluations=8,
+        )
 
 
 def make_evaluator(spec):

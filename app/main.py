@@ -12,6 +12,9 @@ from . import canonical
 from .errors import ApiError
 from .evaluator import Evaluator, Label, Table
 from .provenance import (
+    CounterfactualBudgetExceeded,
+    MAX_RECOMPUTE_EVALUATIONS,
+    MAX_RECOMPUTE_POOL,
     build_symbol_table,
     label_sort_key,
     label_to_string,
@@ -201,18 +204,21 @@ def deletion_sets_for_target(
     target's minimal witnesses. A sum over mixed positive/negative values is
     non-monotone — deleting a row outside every witness can still change the
     total — so its deletion sets are decided by recomputing the plan over
-    the group's source rows; if that search is inapplicable or too large,
-    the hitting-set answer is kept.
+    the target group's source rows. The candidate pool is reduced first
+    (rows provably absent from every minimal deletion set are removed) and
+    then searched within a fixed budget; when the search does not fit the
+    budget, ``COUNTERFACTUAL_BUDGET_EXCEEDED`` is raised instead of returning
+    the (incorrect) hitting-set approximation.
     """
     deletions = minimal_hitting_sets(target_raw["witnesses"])
-    pool = ev.mixed_sign_sum_pool(payload.plan, target_raw["data"])
-    if pool is not None:
-        found = minimal_deletion_sets_by_recompute(
+    search = ev.mixed_sign_sum_search(payload.plan, target_raw["data"])
+    if search is not None:
+        pool, original_size = search
+        deletions = minimal_deletion_sets_by_recompute(
             pool,
             lambda d: kills_target(payload.plan, tables, target_raw["data"], d),
+            pool_size_before_reduction=original_size,
         )
-        if found is not None:
-            deletions = found
     return deletions
 
 
@@ -247,7 +253,23 @@ def execute_query(payload: QueryIn) -> dict[str, Any]:
         target_idx = resolve_target(payload.explain, presented, columns)
         target_raw = rows[target_idx]
         target_presented = presented[target_idx]
-        deletions = deletion_sets_for_target(payload, tables, ev, target_raw)
+        try:
+            deletions = deletion_sets_for_target(payload, tables, ev, target_raw)
+        except CounterfactualBudgetExceeded as e:
+            # Never answer an exhaustive counterfactual question with an
+            # approximation: surface a structured, idempotently replayable
+            # error instead.
+            raise ApiError(
+                "COUNTERFACTUAL_BUDGET_EXCEEDED",
+                "The non-monotone-sum deletion-set search cannot complete "
+                f"within the configured budget: {e.reason}. No approximate "
+                "deletion sets are returned; narrow the target group and retry.",
+                422,
+                pool_size=e.pool_size,
+                reduced_pool_size=e.reduced_size,
+                max_pool_size=MAX_RECOMPUTE_POOL,
+                max_recomputations=MAX_RECOMPUTE_EVALUATIONS,
+            )
 
         scenarios = []
         for h in deletions:

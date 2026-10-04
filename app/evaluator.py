@@ -557,30 +557,19 @@ class Evaluator:
 
     _AGG_FNS = {"count", "sum", "min", "max"}
 
-    # Sentinel for the project walk in mixed_sign_sum_pool: marks input
+    # Sentinel for the project walk in mixed_sign_sum_search: marks input
     # columns the projection did not carry through.
     _UNMAPPED = object()
 
-    def mixed_sign_sum_pool(self, node: Any, target_data: tuple) -> set[Label] | None:
-        """Source labels feeding the target row's group, when that group has
-        a ``sum`` over mixed positive/negative values (a non-monotone sum).
+    def _walk_to_target_aggregate(
+        self, node: Any, target_data: tuple
+    ) -> tuple[dict, tuple]:
+        """Descend from the plan root through filter/project nodes to the
+        innermost aggregate producing the target row.
 
-        *node* is the plan root and *target_data* the target row aligned to
-        its output schema. The walk descends through ``filter``/``project``
-        nodes (which neither change row identity nor dependencies) to the
-        innermost ``aggregate`` producing the target. Returns ``None`` when:
-
-        * no ``sum`` aggregate is involved (count/min/max are exact through
-          hitting sets), or
-        * the target group's values are all non-negative or all non-positive
-          (the sum then changes iff a minimal-combination row is deleted, so
-          hitting sets stay exact), or
-        * the aggregate cannot be reached by the walk (e.g. a join above
-          it), in which case the caller keeps the hitting-set answer.
-
-        Otherwise returns every source label appearing in the witnesses of
-        the target group's member rows — the candidate pool for
-        recomputation-based deletion-set search.
+        Returns the aggregate node and the target values re-aligned to the
+        aggregate's OUTPUT schema. Returns (None, ()) when the target cannot
+        be traced to an aggregate this way (e.g. a join sits above it).
         """
         data = tuple(target_data)
         while True:
@@ -597,25 +586,72 @@ class Evaluator:
                 data = tuple(mapped[name] for name in in_names)
                 node = self._input(node)
             elif t == "aggregate":
-                break
+                return node, data
             else:
-                return None
+                return None, ()
 
-        gb = node.get("group_by", [])
-        aggs = self._agg_spec(node)
+    def mixed_sign_sum_search(
+        self, node: Any, target_data: tuple
+    ) -> tuple[set[Label], int] | None:
+        """Candidate pool for recomputation-based deletion-set search.
+
+        Returns ``(pool, original_pool_size)`` for a target group whose
+        ``sum`` mixes positive and negative values (a non-monotone sum), or
+        ``None`` when the recompute path does not apply:
+
+        * no ``sum`` aggregate is involved (count/min/max are exact through
+          hitting sets), or
+        * the target group's summed values are all non-negative or all
+          non-positive (the sum then changes iff a minimal-combination row
+          is deleted, so hitting sets stay exact), or
+        * the aggregate cannot be reached through filter/project nodes (e.g.
+          a join sits above it), in which case the caller keeps the
+          hitting-set answer.
+
+        The returned pool has already been *reduced*: source rows that can
+        be proved not to occur in any inclusion-minimal deletion set are
+        removed. A member row is reducible when, for every aggregate of the
+        target group, its deletion alone cannot flip that component's exact
+        value:
+
+        * ``count(*)`` pins every member, so no row is reducible;
+        * ``count(col)`` ignores NULLs, so NULL rows are reducible;
+        * ``sum(col)`` ignores NULL/0, and a zero contribution leaves the
+          total unchanged under every other deletion — such rows are
+          reducible (the mixed-sign non-zero rows are exactly the singleton
+          deletions that change the total);
+        * ``min/max(col)`` cannot change by removing a NULL row or a row
+          that does not attain the target extremum.
+
+        Soundness: any deletion set containing a reducible row x either also
+        contains a non-zero-sum row y, in which case {y} already kills the
+        target (the total changes), so the set is not minimal; or it
+        contains only reducible rows, whose removal leaves the group, the
+        count, the extrema and the total untouched, so it does not kill at
+        all. Label-level reduction additionally requires an identity
+        correspondence between member rows and source labels (each member
+        has a single singleton witness, i.e. the aggregate input is a chain
+        of scan/filter/project); otherwise the pool is returned unreduced.
+        """
+        agg_node, out_data = self._walk_to_target_aggregate(node, target_data)
+        if agg_node is None:
+            return None
+
+        gb = agg_node.get("group_by", [])
+        aggs = self._agg_spec(agg_node)
         sum_cols = [col for fn, col, _ in aggs if fn == "sum"]
         if not sum_cols:
             return None
-        out_schema = self._agg_schema(node)
-        values = dict(zip(out_schema, data))
+        out_schema = self._agg_schema(agg_node)
+        values = dict(zip(out_schema, out_data))
         key = tuple(values[g] for g in gb)
         if any(v is self._UNMAPPED for v in key):
             return None
-        in_names = self.schema(self._input(node))
+        in_names = self.schema(self._input(agg_node))
         gi = [in_names.index(g) for g in gb]
         members = [
             r
-            for r in self.eval(self._input(node))
+            for r in self.eval(self._input(agg_node))
             if tuple(r["data"][i] for i in gi) == key
         ]
         mixed = False
@@ -627,11 +663,57 @@ class Evaluator:
                 break
         if not mixed:
             return None
+
         pool: set[Label] = set()
         for r in members:
             for w in r["witnesses"]:
                 pool.update(w)
-        return pool
+        original_size = len(pool)
+
+        # Label-level reduction is only sound with a 1:1 member↔source-row
+        # correspondence (no joins / duplicate-merges below the aggregate).
+        identity = all(
+            len(r["witnesses"]) == 1 and len(next(iter(r["witnesses"]))) == 1
+            for r in members
+        )
+        if not identity:
+            return pool, original_size
+
+        reduced: set[Label] = set()
+        for r in members:
+            (label,) = next(iter(r["witnesses"]))
+            if not self._reducible_member(r, aggs, in_names, values):
+                reduced.add(label)
+        return reduced, original_size
+
+    def _reducible_member(
+        self,
+        member: dict,
+        aggs: list[tuple[str, str | None, str]],
+        names: list[str],
+        target_values: dict[str, Any],
+    ) -> bool:
+        """True when deleting this one member row can contribute to no
+        minimal deletion set: every aggregate component keeps its exact
+        target value regardless of which other rows are (also) deleted."""
+        for fn, col, asname in aggs:
+            ci = names.index(col) if col not in (None, "*") else -1
+            v = member["data"][ci] if ci >= 0 else None
+            if fn == "count":
+                # count(*) counts every member; count(col) ignores NULLs.
+                if col is None or col == "*" or v is not None:
+                    return False
+            elif fn == "sum":
+                # NULL/0 leave every total unchanged; a non-zero contribution
+                # is a singleton kill on a mixed-sign group.
+                if v is not None and v != 0:
+                    return False
+            else:  # min / max
+                # Removing a NULL or a non-extremal row never moves the
+                # extremum; an extremum holder must stay in the pool.
+                if v is not None and v == target_values[asname]:
+                    return False
+        return True
 
     def _agg_spec(self, node: dict):
         aggs = node.get("aggregates", [])

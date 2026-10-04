@@ -541,6 +541,237 @@ def test_counterfactual_recompute_empty_aggregate(client):
     assert sc["recompute_error"]["code"] == "EMPTY_AGGREGATE"
 
 
+def test_sum_mixed_signs_nonmonotone_reappearance_pair(client):
+    """5, 2, -2 (sum=5): deleting {2,-2} brings the total back to 5, so the
+    target REAPPEARS. The pair must be evaluated (it is not pruned as a
+    superset of any non-solution) yet must not be reported — only the three
+    singletons remain minimal deletion sets."""
+    req = {
+        "idempotency_key": "key-agg-mixed-reappear",
+        "tables": [
+            {
+                "table": "orders",
+                "primary_key": ["oid"],
+                "columns": ["oid", "amount"],
+                "rows": [
+                    {"oid": 1, "amount": 5},
+                    {"oid": 2, "amount": 2},
+                    {"oid": 3, "amount": -2},
+                ],
+            }
+        ],
+        "plan": {
+            "type": "aggregate",
+            "input": {"type": "scan", "table": "orders"},
+            "aggregates": [{"fn": "sum", "column": "amount", "as": "total"}],
+        },
+        "explain": {"row": {"total": 5}},
+    }
+    r = client.post("/query", json=req)
+    assert r.status_code == 200, r.text
+    cf = r.json()["counterfactual"]
+    assert cf["minimal_deletion_sets"] == [
+        ["orders[1]"],
+        ["orders[2]"],
+        ["orders[3]"],
+    ]
+    # Only minimal (singleton) deletions get scenarios; the reappearing pair
+    # is not among them.
+    assert all(len(s["delete"]) == 1 for s in cf["scenarios"])
+
+
+def test_sum_mixed_signs_with_ten_zero_rows_reduced_pool(client):
+    """The reported bug: one group with amounts 5, 2, -2 plus ten 0 rows,
+    target total=5. The pool is 13 rows — over the 12-row cap — but the ten
+    zero rows are provably irrelevant to any inclusion-minimal deletion set,
+    so the pool is reduced to 3 and all three singleton deletion sets are
+    returned in label order, with recomputed totals 0, 3, 7."""
+    rows = [
+        {"oid": 1, "cid": 10, "amount": 5},
+        {"oid": 2, "cid": 10, "amount": 2},
+        {"oid": 3, "cid": 10, "amount": -2},
+    ]
+    rows += [{"oid": 100 + i, "cid": 10, "amount": 0} for i in range(10)]
+    req = {
+        "idempotency_key": "key-agg-mixed-ten-zeros",
+        "tables": [
+            {
+                "table": "orders",
+                "primary_key": ["oid"],
+                "columns": ["oid", "cid", "amount"],
+                "rows": rows,
+            }
+        ],
+        "plan": {
+            "type": "aggregate",
+            "input": {"type": "scan", "table": "orders"},
+            "group_by": ["cid"],
+            "aggregates": [{"fn": "sum", "column": "amount", "as": "total"}],
+        },
+        "explain": {"row": {"cid": 10, "total": 5}},
+    }
+    r = client.post("/query", json=req)
+    assert r.status_code == 200, r.text
+    cf = r.json()["counterfactual"]
+    assert cf["minimal_deletion_count"] == 3
+    assert cf["minimal_deletion_sets"] == [
+        ["orders[1]"],
+        ["orders[2]"],
+        ["orders[3]"],
+    ]
+    by_delete = {tuple(sc["delete"]): sc for sc in cf["scenarios"]}
+    # scenarios follow the same label order
+    assert [tuple(sc["delete"]) for sc in cf["scenarios"]] == [
+        ("orders[1]",),
+        ("orders[2]",),
+        ("orders[3]",),
+    ]
+    assert by_delete[("orders[1]",)]["result"]["rows"] == [{"cid": 10, "total": 0}]
+    assert by_delete[("orders[2]",)]["result"]["rows"] == [{"cid": 10, "total": 3}]
+    assert by_delete[("orders[3]",)]["result"]["rows"] == [{"cid": 10, "total": 7}]
+    for sc in cf["scenarios"]:
+        assert sc["target_present"] is False
+    # The zero rows never enter the counterfactual scenarios.
+    deleted_labels = {d[0] for sc in cf["scenarios"] for d in sc["delete"]}
+    assert not any(l.startswith("orders[1") for l in deleted_labels)
+
+    # Idempotent replay of the same request is byte-identical.
+    r2 = client.post("/query", json=req)
+    assert r2.status_code == 200
+    assert r2.content == r.content
+    assert r2.headers["x-idempotent-replay"] == "true"
+
+
+def test_sum_mixed_signs_budget_exceeded_structured_error(client):
+    """A 13-row mixed-sign group with no reducible rows (every row also
+    feeds count(*)) exceeds the pool cap: the API must fail with a
+    structured error, never with an approximate hitting-set response."""
+    rows = [
+        {"oid": 1, "amount": 5},
+        {"oid": 2, "amount": -5},
+    ]
+    rows += [{"oid": 10 + i, "amount": 0} for i in range(11)]
+    req = {
+        "idempotency_key": "key-agg-mixed-budget",
+        "tables": [
+            {
+                "table": "orders",
+                "primary_key": ["oid"],
+                "columns": ["oid", "amount"],
+                "rows": rows,
+            }
+        ],
+        "plan": {
+            "type": "aggregate",
+            "input": {"type": "scan", "table": "orders"},
+            "aggregates": [
+                {"fn": "count", "column": "*", "as": "n"},
+                {"fn": "sum", "column": "amount", "as": "total"},
+            ],
+        },
+        "explain": {"row": {"n": 13, "total": 0}},
+    }
+    r = client.post("/query", json=req)
+    assert r.status_code == 422, r.text
+    err = r.json()["error"]
+    assert err["code"] == "COUNTERFACTUAL_BUDGET_EXCEEDED"
+    assert err["details"]["pool_size"] == 13
+    assert err["details"]["reduced_pool_size"] == 13
+    assert err["details"]["max_pool_size"] == 12
+    # No approximate success payload accompanies the error.
+    assert "counterfactual" not in r.json()
+
+    # Budget errors are pinned to the idempotency key and replay verbatim.
+    r2 = client.post("/query", json=req)
+    assert r2.status_code == 422
+    assert r2.content == r.content
+    assert r2.headers["x-idempotent-replay"] == "true"
+
+
+def test_sum_mixed_signs_count_null_rows_reduced(client):
+    """With count(col), NULL members are ignored by the count and the sum, so
+    they reduce out even though count(*) would pin them: 5, 2, -2 plus ten
+    NULL rows must still yield the three singletons."""
+    rows = [
+        {"oid": 1, "amount": 5},
+        {"oid": 2, "amount": 2},
+        {"oid": 3, "amount": -2},
+    ]
+    rows += [{"oid": 100 + i, "amount": None} for i in range(10)]
+    req = {
+        "idempotency_key": "key-agg-mixed-count-null",
+        "tables": [
+            {
+                "table": "orders",
+                "primary_key": ["oid"],
+                "columns": ["oid", "amount"],
+                "rows": rows,
+            }
+        ],
+        "plan": {
+            "type": "aggregate",
+            "input": {"type": "scan", "table": "orders"},
+            "aggregates": [
+                {"fn": "count", "column": "amount", "as": "n"},
+                {"fn": "sum", "column": "amount", "as": "total"},
+            ],
+        },
+        "explain": {"row": {"n": 3, "total": 5}},
+    }
+    r = client.post("/query", json=req)
+    assert r.status_code == 200, r.text
+    cf = r.json()["counterfactual"]
+    assert cf["minimal_deletion_sets"] == [
+        ["orders[1]"],
+        ["orders[2]"],
+        ["orders[3]"],
+    ]
+    by_delete = {tuple(sc["delete"]): sc for sc in cf["scenarios"]}
+    assert by_delete[("orders[1]",)]["result"]["rows"] == [{"n": 2, "total": 0}]
+    assert by_delete[("orders[2]",)]["result"]["rows"] == [{"n": 2, "total": 3}]
+    assert by_delete[("orders[3]",)]["result"]["rows"] == [{"n": 2, "total": 7}]
+
+
+def test_sum_mixed_signs_with_min_still_reduces_zeros(client):
+    """A simultaneous min aggregate does not pin zero rows: in a mixed-sign
+    group the minimum is always negative (the maximum positive), so zero
+    rows attain neither extremum and still reduce out. 5, -2 plus eleven
+    zeros, target (total=3, lo=-2): the pool reduces to the two non-zero
+    rows."""
+    rows = [
+        {"oid": 1, "amount": 5},
+        {"oid": 2, "amount": -2},
+    ]
+    rows += [{"oid": 100 + i, "amount": 0} for i in range(11)]
+    req = {
+        "idempotency_key": "key-agg-mixed-minmax-hold",
+        "tables": [
+            {
+                "table": "orders",
+                "primary_key": ["oid"],
+                "columns": ["oid", "amount"],
+                "rows": rows,
+            }
+        ],
+        "plan": {
+            "type": "aggregate",
+            "input": {"type": "scan", "table": "orders"},
+            "aggregates": [
+                {"fn": "sum", "column": "amount", "as": "total"},
+                {"fn": "min", "column": "amount", "as": "lo"},
+            ],
+        },
+        "explain": {"row": {"total": 3, "lo": -2}},
+    }
+    r = client.post("/query", json=req)
+    assert r.status_code == 200, r.text
+    cf = r.json()["counterfactual"]
+    # lo=-2 pins only orders[2]; the eleven zero rows attain neither -2 nor
+    # a maximum, so they reduce out; orders[1] (5) and orders[2] (-2) are
+    # both singleton kills for the mixed sum.
+    assert cf["minimal_deletion_sets"] == [["orders[1]"], ["orders[2]"]]
+
+
 def test_error_response_is_canonical_and_cached(client):
     req = {
         "idempotency_key": "key-err-cached",
