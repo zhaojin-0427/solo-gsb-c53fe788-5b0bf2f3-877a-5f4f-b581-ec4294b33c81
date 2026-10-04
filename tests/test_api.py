@@ -482,6 +482,144 @@ def test_sum_mixed_signs_nonmonotone_deletions(client):
         assert sc["target_present"] is False
 
 
+def test_sum_mixed_signs_nonmonotone_with_zero_padding(client):
+    """Regression: 5, 2, -2 plus TEN zero rows (13 source rows > old 12-row
+    cap), total=5. The zero rows are reduced out of the candidate pool (a
+    zero cannot belong to a minimal deletion set for a plain sum), so the
+    exact recompute search still finds the three singleton sets instead of
+    falling back to the single hitting set {orders[1]}."""
+    req = {
+        "idempotency_key": "key-agg-mixed-13",
+        "tables": [
+            {
+                "table": "orders",
+                "primary_key": ["oid"],
+                "columns": ["oid", "amount"],
+                "rows": [
+                    {"oid": 1, "amount": 5},
+                    {"oid": 2, "amount": 2},
+                    {"oid": 3, "amount": -2},
+                ]
+                + [{"oid": oid, "amount": 0} for oid in range(4, 14)],
+            }
+        ],
+        "plan": {
+            "type": "aggregate",
+            "input": {"type": "scan", "table": "orders"},
+            "aggregates": [{"fn": "sum", "column": "amount", "as": "total"}],
+        },
+        "explain": {"row": {"total": 5}},
+    }
+    r = client.post("/query", json=req)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # Only {orders[1]} minimally sums to 5; the 2/-2/zero rows never enter
+    # any minimal witness, so only orders[1] is symbolized.
+    row = body["result"]["rows"][0]
+    assert row["provenance"]["dnf"] == "(s1)"
+    assert body["symbol_table"] == [
+        {"source": "orders[1]", "symbol": "s1"},
+    ]
+    cf = body["counterfactual"]
+    # Three singleton minimal deletion sets in label order — including the
+    # rows (2 and -2) that appear in no minimal sum combination.
+    assert cf["minimal_deletion_sets"] == [
+        ["orders[1]"],
+        ["orders[2]"],
+        ["orders[3]"],
+    ]
+    by_delete = {tuple(sc["delete"]): sc for sc in cf["scenarios"]}
+    # Whole-plan recomputation: totals 0 / 3 / 7.
+    assert by_delete[("orders[1]",)]["result"]["rows"] == [{"total": 0}]
+    assert by_delete[("orders[2]",)]["result"]["rows"] == [{"total": 3}]
+    assert by_delete[("orders[3]",)]["result"]["rows"] == [{"total": 7}]
+    for sc in cf["scenarios"]:
+        assert sc["target_present"] is False
+
+
+def test_sum_mixed_signs_zero_rows_active_under_count(client):
+    """Reduction must keep zero rows when count(*) is also selected:
+    deleting a zero row changes the count, so all 13 rows are singleton
+    minimal deletion sets."""
+    req = {
+        "idempotency_key": "key-agg-mixed-13-count",
+        "tables": [
+            {
+                "table": "orders",
+                "primary_key": ["oid"],
+                "columns": ["oid", "amount"],
+                "rows": [
+                    {"oid": 1, "amount": 5},
+                    {"oid": 2, "amount": 2},
+                    {"oid": 3, "amount": -2},
+                ]
+                + [{"oid": oid, "amount": 0} for oid in range(4, 14)],
+            }
+        ],
+        "plan": {
+            "type": "aggregate",
+            "input": {"type": "scan", "table": "orders"},
+            "aggregates": [
+                {"fn": "count", "column": "*", "as": "n"},
+                {"fn": "sum", "column": "amount", "as": "total"},
+            ],
+        },
+        "explain": {"row": {"n": 13, "total": 5}},
+    }
+    r = client.post("/query", json=req)
+    assert r.status_code == 200, r.text
+    cf = r.json()["counterfactual"]
+    assert cf["minimal_deletion_count"] == 13
+    assert cf["minimal_deletion_sets"] == [
+        [f"orders[{oid}]"] for oid in range(1, 14)
+    ]
+    for sc in cf["scenarios"]:
+        assert sc["target_present"] is False
+    # Deleting a zero row keeps total=5 but changes n, so the full target
+    # row (n=13, total=5) is still gone — recomputed n=12, total=5.
+    zero_case = next(
+        sc for sc in cf["scenarios"] if sc["delete"] == ["orders[10]"]
+    )
+    assert zero_case["result"]["rows"] == [{"n": 12, "total": 5}]
+
+
+def test_counterfactual_search_budget_exceeded_structured(client):
+    """A reduced candidate pool over the cap yields a structured 422 — never
+    a successful response containing the hitting-set approximation — and the
+    error is pinned to the idempotency key with byte-identical replays."""
+    req = {
+        "idempotency_key": "key-agg-budget",
+        "tables": [
+            {
+                "table": "orders",
+                "primary_key": ["oid"],
+                "columns": ["oid", "amount"],
+                "rows": [{"oid": i, "amount": 1} for i in range(1, 21)]
+                + [{"oid": 21, "amount": -1}],
+            }
+        ],
+        "plan": {
+            "type": "aggregate",
+            "input": {"type": "scan", "table": "orders"},
+            "aggregates": [{"fn": "sum", "column": "amount", "as": "total"}],
+        },
+        "explain": {"row": {"total": 19}},
+    }
+    r1 = client.post("/query", json=req)
+    assert r1.status_code == 422, r1.text
+    err = r1.json()["error"]
+    assert err["code"] == "COUNTERFACTUAL_SEARCH_BUDGET_EXCEEDED"
+    assert err["details"]["reduced_pool_size"] == 21
+    assert err["details"]["pool_limit"] == 20
+    assert err["details"]["dropped_inert_label_count"] == 0
+    # No approximation: no counterfactual block, no minimal_deletion_sets.
+    assert "counterfactual" not in r1.json()
+    r2 = client.post("/query", json=req)
+    assert r2.status_code == 422
+    assert r1.content == r2.content
+    assert r2.headers["x-idempotent-replay"] == "true"
+
+
 def test_aggregate_min_max_null_counterfactual(client):
     req = {
         "idempotency_key": "key-agg-min-null",

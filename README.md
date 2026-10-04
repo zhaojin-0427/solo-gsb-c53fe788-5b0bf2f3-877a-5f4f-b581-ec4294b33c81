@@ -360,9 +360,9 @@ curl -s -X POST http://localhost:8000/query \
 
 同组金额一正一负时，`sum` 对删除不是单调的：删掉一行不属于任何极小
 组合的来源行，总和照样会变。此时“令目标行消失的删除集”**不能**由见证
-的命中集刻画（命中集是单调近似，会漏报甚至误报），服务改为对目标组
-的来源行枚举候选删除集，**逐个在删除后的快照上重算整条计划**，以完整
-目标行是否消失为准，返回全部按包含关系极小的方案。
+的命中集刻画（命中集是单调近似，会漏报甚至误报），服务先对目标组做候选
+约简（见下节），再对剩余候选删除集逐个在删除后的快照上重算整条计划，
+以完整目标行是否消失为准，返回全部按包含关系极小的方案。
 
 下面的请求里，组 `cid=10` 的两行金额为 `5` 和 `-5`，合计 `total=0`：
 
@@ -489,6 +489,146 @@ curl -s -X POST http://localhost:8000/query \
 上例中删除 `{2,-2}` 两行反而让总和回到 `5`，目标行重新出现；每个返回
 的方案都经过重算验证且按包含关系极小。
 
+#### 候选约简与搜索预算（金额 `5, 2, -2` 加十条 `0`，共 13 行）
+
+历史行为里，只要目标组的候选行超过 12 行，精确重算搜索就会放弃并退回
+见证命中集近似 —— 对 `5, 2, -2` 加十条 `0`、`total=5` 的请求只报告
+删除 `5`（唯一极小求和组合），漏掉删 `2` / `-2` 两个同样极小的方案。
+现在候选池先做 **候选约简**，再按预算做精确枚举：
+
+* **候选约简（保极小性，不丢方案）**：对目标组的每个聚合表达式，删除后
+  不可能改变目标值的组成员称为“惰性成员”——
+  `count(*)` 无惰性行；`count(col)` 的 `col IS NULL` 行为惰性；
+  `sum(col)` 的 `col IS NULL` 或 `col = 0` 行为惰性（删掉零行总和不变，
+  十条补位 `0` 全部约简掉）；`min/max(col)` 中非 NULL 且不等于目标极值
+  的行为惰性。只在惰性成员见证中出现的来源行标签移出候选池。
+* **精确枚举（不利用失败剪枝）**：按删除集大小递增枚举；**只有已找到
+  解的超集才跳过**（超集必不极小），某个删除集没让目标消失，绝不据此
+  跳过它的超集 —— 混合正负求和下，多删一行可能正好把总和改离目标值。
+* **两道搜索预算**：约简后候选池上限 **20 行**（否则整体 2^n 不可行）；
+  单次反事实搜索的整计划重算次数上限 **10 000 次**。任一预算耗尽都返回
+  结构化错误 `422 COUNTERFACTUAL_SEARCH_BUDGET_EXCEEDED`，**不会**以成功
+  响应输出命中集近似或部分方案；该错误同样绑定幂等键，重放逐字节一致。
+
+下面就是上面那条 13 行输入的实际请求与响应（十条 `0` 被约简，三个单例
+删除集按标签顺序返回，重算总和分别为 `0`、`3`、`7`）：
+
+```bash
+curl -s -X POST http://localhost:8000/query \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "idempotency_key": "readme-mixed-padded-g1",
+  "tables": [
+    {"table": "orders", "primary_key": ["oid"],
+     "columns": [{"name":"oid","type":"int"},{"name":"cid","type":"int"},{"name":"amount","type":"int"}],
+     "rows": [
+       {"oid":1,"cid":10,"amount":5},
+       {"oid":2,"cid":10,"amount":2},
+       {"oid":3,"cid":10,"amount":-2},
+       {"oid":4,"cid":10,"amount":0},{"oid":5,"cid":10,"amount":0},
+       {"oid":6,"cid":10,"amount":0},{"oid":7,"cid":10,"amount":0},
+       {"oid":8,"cid":10,"amount":0},{"oid":9,"cid":10,"amount":0},
+       {"oid":10,"cid":10,"amount":0},{"oid":11,"cid":10,"amount":0},
+       {"oid":12,"cid":10,"amount":0},{"oid":13,"cid":10,"amount":0}
+     ]}
+  ],
+  "plan": {
+    "type": "aggregate",
+    "input": {"type":"scan","table":"orders"},
+    "group_by": ["cid"],
+    "aggregates": [{"fn":"sum","column":"amount","as":"total"}]
+  },
+  "explain": {"row": {"cid":10,"total": 5}}
+}'
+```
+
+实际响应（线上传输为单行紧凑 JSON；这里为可读性格式化）：
+
+```json
+{
+  "status": "ok",
+  "symbol_table": [
+    {"symbol": "s1", "source": "orders[1]"}
+  ],
+  "result": {
+    "columns": ["cid", "total"],
+    "row_count": 1,
+    "rows": [
+      {
+        "row": {"cid": 10, "total": 5},
+        "witness_count": 1,
+        "minimal_witnesses": [
+          {
+            "labels": ["orders[1]"],
+            "symbols": ["s1"],
+            "conjunction": "s1"
+          }
+        ],
+        "provenance": {
+          "dnf": "(s1)",
+          "dnf_structured": [["s1"]],
+          "labels_structured": [["orders[1]"]]
+        }
+      }
+    ]
+  },
+  "counterfactual": {
+    "target_index": 0,
+    "target": {"cid": 10, "total": 5},
+    "target_provenance": {
+      "dnf": "(s1)",
+      "dnf_structured": [["s1"]],
+      "labels_structured": [["orders[1]"]]
+    },
+    "minimal_deletion_count": 3,
+    "minimal_deletion_sets": [
+      ["orders[1]"],
+      ["orders[2]"],
+      ["orders[3]"]
+    ],
+    "scenarios": [
+      {
+        "delete": ["orders[1]"],
+        "target_present": false,
+        "result": {"columns": ["cid", "total"], "row_count": 1,
+                   "rows": [{"cid": 10, "total": 0}]}
+      },
+      {
+        "delete": ["orders[2]"],
+        "target_present": false,
+        "result": {"columns": ["cid", "total"], "row_count": 1,
+                   "rows": [{"cid": 10, "total": 3}]}
+      },
+      {
+        "delete": ["orders[3]"],
+        "target_present": false,
+        "result": {"columns": ["cid", "total"], "row_count": 1,
+                   "rows": [{"cid": 10, "total": 7}]}
+      }
+    ]
+  }
+}
+```
+
+解读：十条 `0` 行既不进入任何极小求和组合（符号表只有 `s1`），也被候选
+约简移出重算搜索池；但 `2` 与 `-2` 是非零行，删任一行都会改变总和，
+所以仍是极小删除集。若同一计划再选 `count(*)`，零行就不再是惰性行
+（删它们会改变计数），约简会保留全部 13 行，十三个单例删除集全部返回。
+
+#### 预算耗尽：结构化错误，不输出近似方案
+
+目标组约简后仍超过 20 个有效行时（例如 20 个 `1` 加一个 `-1`，共 21 行
+非零、`total=19`），服务返回 HTTP `422` 和规范化错误体，响应中没有
+`counterfactual` 字段；用同一个幂等键重试返回逐字节相同的错误体：
+
+```json
+{"error":{"code":"COUNTERFACTUAL_SEARCH_BUDGET_EXCEEDED",
+ "message":"The exact counterfactual search for this non-monotone (mixed positive/negative) sum could not finish within the configured budget; no approximate deletion sets are returned. Retry with a smaller target group or split the request.",
+ "details":{"active_member_count":21,"dropped_inert_label_count":0,
+            "full_pool_size":21,"group_member_count":21,
+            "pool_limit":20,"reduced_pool_size":21}}}
+```
+
 ### 幂等重放逐字节一致
 
 ```bash
@@ -521,6 +661,7 @@ cmp a.json b.json && echo "byte-identical"   # byte-identical
 | `EMPTY_AGGREGATE` | 聚合输入为空（无法形成任何组；含标量聚合） |
 | `TYPE_ERROR` | 声明类型不符、跨类型比较/连接、对非数值求 `sum`、对布尔值做有序比较 |
 | `TARGET_NOT_FOUND` | `explain` 的 index 越界或 row 不匹配任何输出 |
+| `COUNTERFACTUAL_SEARCH_BUDGET_EXCEEDED` | 混合正负 `sum` 的精确反事实搜索耗尽预算（约简后候选池超过 20 行，或整计划重算超过 10 000 次；HTTP 422，不返回近似方案） |
 | `IDEMPOTENCY_KEY_CONFLICT` | 幂等键已绑定到另一个规范化请求（HTTP 409） |
 
 ---
@@ -538,8 +679,12 @@ cmp a.json b.json && echo "byte-identical"   # byte-identical
   命中所有见证后，组键或某个聚合值必然改变。
 * 例外是 **含正负混合值的 `sum`**（非单调求和）：删除不属于任何极小组合的
   行也可能改变总和，且删除更多行可能让目标值重新出现，命中集刻画不再成立。
-  此时服务对目标组的来源行枚举候选删除集，**按删除后重算的完整目标行**
-  判定，返回全部按包含关系极小的方案（候选池超过 12 行时回退为命中集
-  近似）。无论走哪条路径，每个删除场景都会 **重算整条计划** 并显式给出
-  `target_present`，以重算结果为准；删除后聚合输入为空时，场景返回结构化
-  的 `recompute_error`（如 `EMPTY_AGGREGATE`）。
+  此时服务先对目标组做 **候选约简**（`sum` 的零值/NULL 行、`min/max` 的非
+  极值行、`count(col)` 的 NULL 行不可能出现在任何极小删除集中，被移出候选
+  池），再对剩余候选行按删除集大小递增枚举，**按删除后重算的完整目标行**
+  判定，返回全部按包含关系极小的方案；枚举中只有已找到解的超集才被跳过，
+  未命中的删除集不会剪枝其超集。约简后候选池超过 20 行、或整计划重算超过
+  10 000 次时返回结构化错误 `COUNTERFACTUAL_SEARCH_BUDGET_EXCEEDED`（HTTP
+  422），绝不回退为命中集近似。无论走哪条路径，每个删除场景都会 **重算整条
+  计划** 并显式给出 `target_present`，以重算结果为准；删除后聚合输入为空时，
+  场景返回结构化的 `recompute_error`（如 `EMPTY_AGGREGATE`）。

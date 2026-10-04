@@ -133,37 +133,87 @@ def minimal_hitting_sets(witnesses: set[Witness]) -> list[frozenset[Label]]:
 # Recomputation-based minimal deletion sets (non-monotone sum)
 # ---------------------------------------------------------------------------
 
-# Upper bound on the candidate-pool size for the exhaustive subset search.
-# Pools are the source rows feeding one output group, so they stay small in
-# practice; beyond the bound the caller falls back to hitting sets.
-MAX_RECOMPUTE_POOL = 12
+# After candidate reduction (see Evaluator.mixed_sign_sum_pool) the pool only
+# contains source rows that can change at least one aggregate value of the
+# target group; even so, exhaustive subset enumeration is 2**n, so the
+# reduced pool is capped. Beyond the cap the request fails with a structured
+# budget error — a hitting-set approximation is never returned as success.
+MAX_RECOMPUTE_POOL = 20
+
+# Cap on whole-plan recomputations per counterfactual search. Every candidate
+# deletion set is validated by recomputing the full plan on the filtered
+# snapshot; this bounds the worst-case cost of one /query call.
+MAX_RECOMPUTE_CALLS = 10_000
+
+
+class SearchBudgetExceeded(Exception):
+    """Exact deletion-set enumeration could not finish within budget.
+
+    ``reason`` is ``"pool_too_large"`` (reduced candidate pool over the
+    enumeration cap) or ``"recompute_budget"`` (call cap hit mid-search).
+    ``details`` carries machine-readable statistics merged with pool
+    statistics by the caller into a structured error response.
+    """
+
+    def __init__(self, reason: str, **details: object):
+        super().__init__(reason)
+        self.reason = reason
+        self.details = details
 
 
 def minimal_deletion_sets_by_recompute(
     pool: Iterable[Label],
     kills: Callable[[frozenset[Label]], bool],
+    *,
     max_pool_size: int = MAX_RECOMPUTE_POOL,
-) -> list[frozenset[Label]] | None:
+    max_calls: int = MAX_RECOMPUTE_CALLS,
+) -> list[frozenset[Label]]:
     """All inclusion-minimal subsets D of *pool* for which ``kills(D)`` holds.
 
     ``kills(D)`` recomputes the whole plan with the rows in D removed and
     reports whether the full target row is gone (a recompute error such as
     EMPTY_AGGREGATE counts as gone). Unlike hitting sets, the solutions of a
     non-monotone sum are not upward-closed — deleting more rows can make the
-    target value reappear — so candidates are enumerated in increasing size
-    and only supersets of already-found solutions are skipped (those are
-    either non-solutions or non-minimal). Returns ``None`` when the pool is
-    too large to enumerate exhaustively.
+    target value reappear — so candidates are enumerated in increasing size.
+
+    Pruning rule: a candidate is skipped **only** when it is a superset of an
+    already-found solution (it could never be inclusion-minimal). The fact
+    that some smaller set did *not* kill the target never prunes its
+    supersets — in a mixed-sign sum deleting further rows may well kill a
+    target the smaller deletion left alive.
+
+    Raises ``SearchBudgetExceeded`` when the reduced pool exceeds
+    ``max_pool_size`` or when more than ``max_calls`` recomputations would be
+    needed; no partial/approximate answer is returned.
     """
     labels = sorted(set(pool), key=label_sort_key)
     if len(labels) > max_pool_size:
-        return None
+        raise SearchBudgetExceeded(
+            "pool_too_large",
+            reduced_pool_size=len(labels),
+            pool_limit=max_pool_size,
+        )
+
     solutions: list[frozenset[Label]] = []
+    calls = 0
+
+    def evaluate(candidate: frozenset[Label]) -> bool:
+        nonlocal calls
+        calls += 1
+        if calls > max_calls:
+            raise SearchBudgetExceeded(
+                "recompute_budget",
+                reduced_pool_size=len(labels),
+                recompute_calls=calls,
+                recompute_budget_limit=max_calls,
+            )
+        return kills(candidate)
+
     for size in range(len(labels) + 1):
         for combo in itertools.combinations(labels, size):
             candidate = frozenset(combo)
             if any(s <= candidate for s in solutions):
                 continue
-            if kills(candidate):
+            if evaluate(candidate):
                 solutions.append(candidate)
     return sorted(solutions, key=deletion_set_sort_key)

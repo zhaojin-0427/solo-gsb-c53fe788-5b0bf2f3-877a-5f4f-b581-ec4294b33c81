@@ -41,6 +41,38 @@ Witness = frozenset[Label]
 Col = tuple[str, str | None]
 
 
+class RecomputePool:
+    """Reduced candidate pool for recomputation-based deletion-set search.
+
+    Attributes:
+      full:    every source label in the target group's member witnesses;
+      reduced: labels whose deletion can actually belong to an
+               inclusion-minimal counterfactual (see candidate reduction in
+               ``mixed_sign_sum_pool``);
+      group_member_count: number of input rows in the target group;
+      active_member_count: number of those that can change at least one
+               aggregate value of the target output.
+    """
+
+    __slots__ = ("full", "reduced", "group_member_count", "active_member_count")
+
+    def __init__(
+        self,
+        full: set[Label],
+        reduced: set[Label],
+        group_member_count: int,
+        active_member_count: int,
+    ):
+        self.full = full
+        self.reduced = reduced
+        self.group_member_count = group_member_count
+        self.active_member_count = active_member_count
+
+    @property
+    def dropped_inert_count(self) -> int:
+        return len(self.full) - len(self.reduced)
+
+
 # ---------------------------------------------------------------------------
 # Table loading / validation
 # ---------------------------------------------------------------------------
@@ -561,9 +593,9 @@ class Evaluator:
     # columns the projection did not carry through.
     _UNMAPPED = object()
 
-    def mixed_sign_sum_pool(self, node: Any, target_data: tuple) -> set[Label] | None:
-        """Source labels feeding the target row's group, when that group has
-        a ``sum`` over mixed positive/negative values (a non-monotone sum).
+    def mixed_sign_sum_pool(self, node: Any, target_data: tuple) -> "RecomputePool | None":
+        """Reduced candidate pool for the target row when its group has a
+        ``sum`` over mixed positive/negative values (a non-monotone sum).
 
         *node* is the plan root and *target_data* the target row aligned to
         its output schema. The walk descends through ``filter``/``project``
@@ -572,15 +604,34 @@ class Evaluator:
 
         * no ``sum`` aggregate is involved (count/min/max are exact through
           hitting sets), or
-        * the target group's values are all non-negative or all non-positive
-          (the sum then changes iff a minimal-combination row is deleted, so
-          hitting sets stay exact), or
+        * the target group's sum values are all non-negative or all
+          non-positive (the sum then changes iff a minimal-combination row is
+          deleted, so hitting sets stay exact), or
         * the aggregate cannot be reached by the walk (e.g. a join above
           it), in which case the caller keeps the hitting-set answer.
 
-        Otherwise returns every source label appearing in the witnesses of
-        the target group's member rows — the candidate pool for
-        recomputation-based deletion-set search.
+        Candidate reduction
+        -------------------
+        A source row that cannot change *any* aggregate value of the target
+        output can never belong to an inclusion-minimal deletion set for that
+        full output row, so its exclusive labels are excluded from the
+        returned pool. Per aggregate over the target group, an input member
+        is *inert* when:
+
+        * ``count(*)``: never inert (each member changes the count);
+        * ``count(col)``: its ``col`` value is NULL (NULLs are not counted);
+        * ``sum(col)``: its ``col`` value is NULL or zero (zero leaves the
+          total unchanged; this removes arbitrary many padding zero rows);
+        * ``min``/``max(col)``: its non-NULL value differs from the target
+          extremum — removing it cannot move the extremum.
+
+        A member is *active* when it is non-inert for at least one aggregate.
+        The reduced pool is the union of the active members' witness labels
+        (any label supporting only inert members is dropped). Every minimal
+        deletion set of the full pool is contained in the reduced pool:
+        deleting inert members alone leaves every target aggregate value
+        untouched and the group key fixed, and an inert member added to a
+        killing set is removable without restoring the target row.
         """
         data = tuple(target_data)
         while True:
@@ -627,11 +678,57 @@ class Evaluator:
                 break
         if not mixed:
             return None
-        pool: set[Label] = set()
-        for r in members:
+
+        # Target aggregate values, aligned to the spec: all-NULL sums/mins
+        # are None. A member is active iff deleting it can change at least
+        # one target aggregate value (see the class docstring).
+        active = [False] * len(members)
+        for fn, col, asname in aggs:
+            target = values[asname]
+            if fn == "count":
+                if col is None or col == "*":
+                    for i in range(len(members)):
+                        active[i] = True
+                else:
+                    ci = in_names.index(col)
+                    for i, m in enumerate(members):
+                        if m["data"][ci] is not None:
+                            active[i] = True
+            elif fn == "sum":
+                ci = in_names.index(col)
+                for i, m in enumerate(members):
+                    v = m["data"][ci]
+                    if v is not None and v != 0:
+                        active[i] = True
+            else:  # min / max
+                ci = in_names.index(col)
+                for i, m in enumerate(members):
+                    v = m["data"][ci]
+                    if v is not None and target is not None and v == target:
+                        active[i] = True
+
+        full_pool: set[Label] = set()
+        reduced_pool: set[Label] = set()
+        for i, r in enumerate(members):
+            member_labels: set[Label] = set()
             for w in r["witnesses"]:
-                pool.update(w)
-        return pool
+                member_labels.update(w)
+            full_pool.update(member_labels)
+            if active[i]:
+                reduced_pool.update(member_labels)
+
+        # Defensive: an empty reduced pool would mean no singleton pool at
+        # all, but a mixed-sign sum guarantees non-zero members exist; leave
+        # the exact-path decision to the caller rather than searching nothing.
+        if not reduced_pool:
+            return None
+
+        return RecomputePool(
+            full=full_pool,
+            reduced=reduced_pool,
+            group_member_count=len(members),
+            active_member_count=sum(active),
+        )
 
     def _agg_spec(self, node: dict):
         aggs = node.get("aggregates", [])

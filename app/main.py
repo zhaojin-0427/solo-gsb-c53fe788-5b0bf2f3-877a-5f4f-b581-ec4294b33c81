@@ -10,8 +10,9 @@ from pydantic import BaseModel, Field, ConfigDict, ValidationError
 
 from . import canonical
 from .errors import ApiError
-from .evaluator import Evaluator, Label, Table
+from .evaluator import Evaluator, Label, RecomputePool, Table
 from .provenance import (
+    SearchBudgetExceeded,
     build_symbol_table,
     label_sort_key,
     label_to_string,
@@ -200,20 +201,48 @@ def deletion_sets_for_target(
     same-sign values) these are exactly the minimal hitting sets of the
     target's minimal witnesses. A sum over mixed positive/negative values is
     non-monotone — deleting a row outside every witness can still change the
-    total — so its deletion sets are decided by recomputing the plan over
-    the group's source rows; if that search is inapplicable or too large,
-    the hitting-set answer is kept.
+    total — so its deletion sets are decided by recomputing the plan over a
+    reduced candidate pool (zero/NULL/non-extremal members excluded). When
+    the exact search cannot finish within the enumeration/recomputation
+    budget a structured COUNTERFACTUAL_SEARCH_BUDGET_EXCEEDED error is raised;
+    the hitting-set answer is never silently substituted for it.
     """
-    deletions = minimal_hitting_sets(target_raw["witnesses"])
     pool = ev.mixed_sign_sum_pool(payload.plan, target_raw["data"])
     if pool is not None:
-        found = minimal_deletion_sets_by_recompute(
-            pool,
-            lambda d: kills_target(payload.plan, tables, target_raw["data"], d),
+        return search_deletion_sets(payload, tables, target_raw["data"], pool)
+    return minimal_hitting_sets(target_raw["witnesses"])
+
+
+def search_deletion_sets(
+    payload: QueryIn,
+    tables: dict[str, Table],
+    target_data: tuple,
+    pool: RecomputePool,
+) -> list[frozenset[Label]]:
+    """Run the exact recomputation search, converting budget exhaustion to
+    a structured 422 error carrying the pool statistics."""
+    try:
+        return minimal_deletion_sets_by_recompute(
+            pool.reduced,
+            lambda d: kills_target(payload.plan, tables, target_data, d),
         )
-        if found is not None:
-            deletions = found
-    return deletions
+    except SearchBudgetExceeded as e:
+        details = {
+            "group_member_count": pool.group_member_count,
+            "active_member_count": pool.active_member_count,
+            "full_pool_size": len(pool.full),
+            "dropped_inert_label_count": pool.dropped_inert_count,
+            **e.details,
+        }
+        raise ApiError(
+            "COUNTERFACTUAL_SEARCH_BUDGET_EXCEEDED",
+            "The exact counterfactual search for this non-monotone (mixed "
+            "positive/negative) sum could not finish within the configured "
+            "budget; no approximate deletion sets are returned. Retry with a "
+            "smaller target group or split the request.",
+            422,
+            **details,
+        )
 
 
 def execute_query(payload: QueryIn) -> dict[str, Any]:

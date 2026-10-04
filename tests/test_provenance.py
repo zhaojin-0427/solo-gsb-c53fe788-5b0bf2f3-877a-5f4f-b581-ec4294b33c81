@@ -1,6 +1,12 @@
 """Unit tests for minimal hitting sets and witness construction."""
+import pytest
+
 from app.evaluator import Evaluator, Table
-from app.provenance import minimal_deletion_sets_by_recompute, minimal_hitting_sets
+from app.provenance import (
+    SearchBudgetExceeded,
+    minimal_deletion_sets_by_recompute,
+    minimal_hitting_sets,
+)
 
 
 def L(table, *pk):
@@ -50,9 +56,50 @@ def test_deletion_sets_by_recompute():
         pool, lambda d: d == frozenset([L("t", 1)])
     )
     assert sols == [frozenset([L("t", 1)])]
-    # Pools beyond the enumeration bound refuse the search.
-    big = {L("t", i) for i in range(13)}
-    assert minimal_deletion_sets_by_recompute(big, lambda d: True) is None
+
+
+def test_non_killing_set_must_not_prune_its_supersets():
+    """Mixed-sign sums are non-monotone: a set that fails to kill the target
+    says nothing about its supersets, so the search still has to test them."""
+    pool = {L("t", 1), L("t", 2), L("t", 3)}
+    # Only exact pairs kill; the singletons (and the empty set) do not.
+    sols = minimal_deletion_sets_by_recompute(
+        pool, lambda d: len(d) == 2
+    )
+    assert sols == [
+        frozenset([L("t", 1), L("t", 2)]),
+        frozenset([L("t", 1), L("t", 3)]),
+        frozenset([L("t", 2), L("t", 3)]),
+    ]
+    # Every odd-sized candidate kills, even sizes do not: supersets of a
+    # failing singleton (the triples) must still be enumerated.
+    sols = minimal_deletion_sets_by_recompute(
+        pool, lambda d: len(d) % 2 == 1
+    )
+    assert sols == [
+        frozenset([L("t", 1)]),
+        frozenset([L("t", 2)]),
+        frozenset([L("t", 3)]),
+    ]
+
+
+def test_search_budget_pool_too_large():
+    # Pools beyond the enumeration cap raise a structured budget error
+    # instead of returning None (no approximate hitting-set answer).
+    big = {L("t", i) for i in range(21)}
+    with pytest.raises(SearchBudgetExceeded) as exc:
+        minimal_deletion_sets_by_recompute(big, lambda d: True)
+    assert exc.value.reason == "pool_too_large"
+    assert exc.value.details["reduced_pool_size"] == 21
+
+
+def test_search_budget_recompute_calls():
+    # A call cap lower than the 2**n enumeration surfaces mid-search.
+    big = {L("t", i) for i in range(10)}
+    with pytest.raises(SearchBudgetExceeded) as exc:
+        minimal_deletion_sets_by_recompute(big, lambda d: False, max_calls=5)
+    assert exc.value.reason == "recompute_budget"
+    assert exc.value.details["recompute_calls"] == 6
 
 
 def make_evaluator(spec):
@@ -281,6 +328,74 @@ def test_aggregate_null_components():
     rows = ev.eval(plan_null)
     assert rows[0]["data"] == (0, None)
     assert rows[0]["witnesses"] == {frozenset([L("t", 2)])}
+
+
+def test_mixed_sign_sum_pool_reduction():
+    """5, 2, -2 + ten zero rows + one NULL row: only the three non-zero
+    labels survive candidate reduction for a plain sum."""
+    tables = [
+        {
+            "table": "t",
+            "primary_key": ["id"],
+            "columns": ["id", "v"],
+            "rows": [{"id": 1, "v": 5}, {"id": 2, "v": 2}, {"id": 3, "v": -2}]
+            + [{"id": i, "v": 0} for i in range(4, 14)]
+            + [{"id": 14, "v": None}],
+        }
+    ]
+    plan = {
+        "type": "aggregate",
+        "input": {"type": "scan", "table": "t"},
+        "aggregates": [{"fn": "sum", "column": "v", "as": "total"}],
+    }
+    ev = make_evaluator(tables)
+    pool = ev.mixed_sign_sum_pool(plan, (5,))
+    assert pool is not None
+    assert pool.group_member_count == 14
+    assert pool.active_member_count == 3
+    assert pool.reduced == {L("t", 1), L("t", 2), L("t", 3)}
+    # The full pool covers all group-member witnesses (existence includes the
+    # NULL row); the reduced pool drops ten zero rows plus the NULL row.
+    assert len(pool.full) == 14
+    assert pool.dropped_inert_count == 11
+
+    # Same-sign sums (even with zero padding) do not enter the exact path.
+    tables_pos = [
+        {
+            "table": "t",
+            "primary_key": ["id"],
+            "columns": ["id", "v"],
+            "rows": [{"id": 1, "v": 5}] + [{"id": i, "v": 0} for i in range(2, 14)],
+        }
+    ]
+    ev_pos = make_evaluator(tables_pos)
+    assert ev_pos.mixed_sign_sum_pool(plan, (5,)) is None
+
+
+def test_mixed_sign_sum_pool_reduction_count_star():
+    """Under count(*) every member is active: zero rows stay in the pool."""
+    tables = [
+        {
+            "table": "t",
+            "primary_key": ["id"],
+            "columns": ["id", "v"],
+            "rows": [{"id": 1, "v": 5}, {"id": 2, "v": 2}, {"id": 3, "v": -2}]
+            + [{"id": i, "v": 0} for i in range(4, 14)],
+        }
+    ]
+    plan = {
+        "type": "aggregate",
+        "input": {"type": "scan", "table": "t"},
+        "aggregates": [
+            {"fn": "count", "column": "*", "as": "n"},
+            {"fn": "sum", "column": "v", "as": "total"},
+        ],
+    }
+    ev = make_evaluator(tables)
+    pool = ev.mixed_sign_sum_pool(plan, (13, 5))
+    assert pool is not None
+    assert pool.active_member_count == 13
+    assert len(pool.reduced) == 13
 
 
 def test_empty_aggregate_input():
